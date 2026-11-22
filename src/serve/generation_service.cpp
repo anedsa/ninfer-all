@@ -416,8 +416,8 @@ GenerationService::GenerationService(
 void GenerationService::refuse_family_options() const {
     // Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next (also dense Qwen4) keep context
     // caches of their own, with a prefix cache file and session slots but not the hybrid prefix
-    // cache; Gemma 4, Flint and Inkling 2 cannot close their reasoning early. Those options would
-    // start and do nothing.
+    // cache; Gemma 4 and Flint cannot close their reasoning early. Those options would start and
+    // do nothing.
     const std::string architecture = engine_->load_summary().architecture;
     const bool own_cache =
         architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM" ||
