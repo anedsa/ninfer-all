@@ -151,6 +151,16 @@ batch drafts until each of its requests has reached the floor or the round's wid
 ran nearly every step for all of them and were slower than plain steps
 ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)).
 
+The Inkling 2 Engine also times a lone DSpark request's rounds against plain decoding, since at a
+long context a round can cost more than the tokens it keeps save. It keeps decayed sums of the
+tokens committed and the seconds spent in the running mode; every 64 steps it runs the other mode
+for a few (4 plain steps, or 8 rounds while the request decodes plainly, after one warm-up step
+each) and switches when that mode committed tokens more than 3% faster. A plain step only slows
+down as the context grows, so while rounds lead the plain rate last measured by more than 10% the
+plain probe is skipped. Plain steps still write the drafter's caches, so a round can follow any
+plain step, and both modes commit the target's own tokens, so the text does not change. A new
+request starts with drafts.
+
 ### MTP attention window
 
 Each MTP draft step attends over the whole history of its cache, so at a long context the draft
@@ -1203,9 +1213,9 @@ because requests can explicitly enable thinking. A request overrides this defaul
 integer: `thinking_budget` on Chat Completions and Responses (a NInfer extension, accepted at top
 level), or `thinking:{"type":"enabled","budget_tokens":N}` on Anthropic Messages (a value of at
 least 1024 and below `max_tokens`, per that protocol). A request that does not think receives no
-cap, whatever it sends; an Inkling 2 chat request, whose model opens its thinking blocks itself,
-always takes the cap. Gemma 4 and Flint cannot close their reasoning early: the server refuses the
-flag for them at startup and ignores a request's budget.
+cap, whatever it sends. The models of Inkling 2, Flint and Gemma 4 open their reasoning themselves:
+an Inkling 2 chat request always takes the cap, a Flint one unless it turns thinking off, and a
+Gemma 4 one when it turns thinking on.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
@@ -1243,12 +1253,14 @@ Logs report the requested budget, and the effective budget when it differs. A re
 enforce its budget reports the requested value only. The server does not promise that the model will
 emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
 counts the model's thinking tokens for every Qwen thinking request, with or without a budget.
-Gemma 4 and Flint take no thinking budget and report 0. DeepSeek-V4.1 counts its thinking tokens,
-and a reached budget closes its reasoning with the guidance and its `</think>` token, as Qwen's does.
-Inkling 2 counts the tokens of every thinking block it opens in a response (not their headers and
-end markers); a reached budget closes the open block with the guidance and `<|end_message|>`, and
-the rest of the response can open no thinking block (`<|content_thinking|>` is masked) and runs
-without drafts.
+DeepSeek-V4.1 counts its thinking tokens, and a reached budget closes its reasoning with the
+guidance and its `</think>` token, as Qwen's does. Inkling 2 counts the tokens of every thinking
+block it opens in a response (not their headers and end markers); a reached budget closes the open
+block with the guidance and `<|end_message|>`, and the rest of the response can open no thinking
+block (`<|content_thinking|>` is masked). Flint counts the tokens of the `<think>` block it opens
+and Gemma 4 those of its thought channel (not the channel's name); a reached budget closes the
+block with the guidance and `</think>` (Gemma 4: `<channel|>`), and the rest of the response can
+open no other (`<think>` or `<|channel>` is masked).
 
 `--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
 model that keeps rewriting the same passages in its thinking, which token penalties do not catch
@@ -1282,10 +1294,10 @@ because every pass varies a little.
   thinking budget could not be enforced (early close unavailable, above), it stops instead.
 - **Gemma 4, Flint and Inkling 2.** The guard reads the thought channel (Flint: the `<think>`
   block; Inkling 2: its `<|content_thinking|>` blocks, counted across the blocks of one response)
-  the model opens and counts its tokens. Gemma 4 and Flint have no early-close control, so
-  `conclude` stops there as `stop` does; Inkling 2 concludes with the guidance and
-  `<|end_message|>`, as a reached budget does. DeepSeek-V4.1 concludes as Qwen does, with the same
-  guidance and its own `</think>` token.
+  the model opens and counts its tokens, and `conclude` closes it as a reached budget does: Inkling
+  2 with the guidance and `<|end_message|>`, Flint with the guidance and `</think>`, Gemma 4 with
+  the guidance and `<channel|>`. DeepSeek-V4.1 concludes as Qwen does, with the same guidance and
+  its own `</think>` token.
 - It applies to constrained requests too (tool constraints, `response_format`): the control span
   goes through the same grammar-checked path as a thinking budget, so a constrained request can
   still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
@@ -2537,7 +2549,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-confidence C` | DSpark only: verify a round's drafts up to the first its confidence head scores below `C` (`0..1`); `0` verifies every draft | `0.5` |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
-| `--adaptive-mtp` | MTP: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; DFlash, DFlash2 and DSpine on Qwen3.5-core models: each round without a copy drafts and verifies `--draft-tokens` or half of them, chosen the same way; Inkling 2's DSpark: a lone request's round drafts 1..`--draft-tokens`; see [Adaptive MTP](#adaptive-mtp) | off |
+| `--adaptive-mtp` | MTP: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; DFlash, DFlash2 and DSpine on Qwen3.5-core models: each round without a copy drafts and verifies `--draft-tokens` or half of them, chosen the same way; Inkling 2's DSpark: a lone request's round drafts 1..`--draft-tokens`, and the request decodes plainly while its measured rounds commit tokens slower; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp` or `dflash2`; Flint, which has no drafter, and Inkling 2 without it): the last `N` tokens are matched against the sequence so far and what followed is proposed, from the occurrence the sequence was already copying while it still matches, else from the newest; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`; with DFlash, DFlash2 or DSpine at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
