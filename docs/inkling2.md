@@ -55,10 +55,12 @@ tokenization, the chat template, output parsing and the serving protocols.
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
   chunks decoded to F16), FP32 scores, softmax and sums. The SIMT kernel starts each row from that
   state and reads the nearer keys with their relative bias. A full visit's decode and verification
-  rows split their keys into about 16 blocks a multiprocessor (at most 128, each at least 64 keys),
-  the same split for every row of every call, so a verification row computes what a decode step
-  computes. On an RTX 3090 a 120,103-token prompt prefills at 1.52k tok/s instead of 501 and then
-  decodes at 65.4 tok/s instead of 46.8 ([measurements](#long-contexts)).
+  rows split their keys into about 32 blocks a multiprocessor (at most 512, each at least 64 keys),
+  the same split for every row of every call; a verification call's rows of one sequence go up to
+  four to a block, which reads each key tile once for them, and each row reads the tiles of its own
+  split, so a verification row computes what a decode step computes. On an RTX 3090 a
+  120,103-token prompt prefills at 1.52k tok/s instead of 501 and then decodes at 67.1 tok/s
+  instead of 46.8 ([measurements](#long-contexts)).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns and requests with host-memory images
   ([below](#prefix-reuse)), branched reads for [typed decisions](serving.md#typed-decisions) and
@@ -210,7 +212,9 @@ state at the end of the prompt's shared prefixes (the leading system messages an
 declarations, a declared cache boundary), go to images in pinned host memory within
 `--host-cache-mib`. Every visit's state belongs to the image: its rings, its full-attention rows and
 its convolution histories. A prompt resumes only where a state was kept, not at an arbitrary common
-prefix. A long last message also keeps a state inside it, where a later prompt with the same
+prefix, except on its sequence: a next prompt that departs from what the sequence read after its
+last prompt (a reply the template renders otherwise) resumes where it departs, the sequence taken
+back there, while its rings and convolution histories still hold that position. A long last message also keeps a state inside it, where a later prompt with the same
 document and another question resumes, and the images go to a disk tier, a prefix cache file and
 session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 
@@ -317,17 +321,20 @@ kernels](#what-runs) and the build before them. The server's own prefill and dec
 
 | Prompt tokens | Prefill, before | Prefill | `--spec none` decode, before | `--spec none` decode | DSpark decode, before | DSpark decode |
 |---:|---:|---:|---:|---:|---:|---:|
-| 7,968 | 1.91k | 2.19k | 96.7 | 100.6 | 101.3 | 110.4 |
-| 32,008 | 1.20k | 2.01k | 78.6 | 90.1 | 111.9 | 118.1 |
-| 120,103 | 501 | 1.52k | 46.8 | 65.4 | 62.8 | 57.4 |
+| 7,968 | 1.91k | 2.19k | 96.7 | 100.4 | 101.3 | 111.0 |
+| 32,008 | 1.20k | 2.01k | 78.6 | 90.3 | 111.9 | 117.4 |
+| 120,103 | 501 | 1.52k | 46.8 | 67.1 | 62.8 | 57.4 |
 
-DSpark's text equals `--spec none`'s in both builds at every length. The text itself changed with
-the far field's F16 probabilities and the new splits, so DSpark accepted other drafts: after the
-120,103-token prompt, 108 of 209 against 150 of 227. A round there took about 30 ms against 39 ms
-before, but at 1.7 tokens a round it decodes more slowly than plain decoding's 15.3 ms a token; a
-round costs 1.7 decode steps after 7,968 tokens and 2.0 after 32,008 and 120,103. Mean NLL over the first 200,000 bytes of
-WikiText `00.txt` (49,478 tokens, 16,384-token windows at an 8,192-token stride) is 1.739363
-against 1.739591 before (-0.013%), and `ninfer-perplexity` scored them in 102 s against 125 s.
+DSpark's text equals `--spec none`'s in both builds at every length; the text itself changed with
+the far field's F16 probabilities and the new splits. DSpark's rate follows the drafts the text
+accepts and the widths its rounds adapt to: after 120,103 tokens a round took 27.3 ms and kept 1.6
+tokens, so plain decoding at 14.9 ms a token stays faster there; after 32,008 tokens a round took
+21.1 ms and kept 2.5 tokens (plain decoding 11.1 ms a token), after 7,968 tokens 16.9 ms and 1.9
+(10.0 ms). With 128 splits, grouping the verification rows took a round after 120,103 tokens from
+30.1 to 28.8 ms (1.4 and 1.5 drafts a round). The prompt kernels' mean NLL over the first 200,000
+bytes of WikiText `00.txt` (49,478 tokens, 16,384-token windows at an 8,192-token stride) is
+1.739363 against 1.739591 before (-0.013%), and `ninfer-perplexity` scored them in 102 s against
+125 s.
 
 ### APEX-I MiniPlus
 
@@ -588,8 +595,12 @@ and 117.8 with DSpark, against 109.7 and 125.3 on the device; disk experts, the 
 page cache, 99.9 and 114.3 with DSpark. Without the profile the cache fills as the first requests
 route: host 86.2 and 87.7 tok/s (95.1% hits), disk 45.6 (93.5%). The profile adds 0.6 to 0.9 s to
 a host start and 1.6 s to a disk start. With a cache of part of the experts the profile also raises
-the hits, but the first tokens decode slower: with `--expert-cache-mib 8192` (1,879 slots), 1,536
-tokens decode 1.05 times as fast (85.2 and 87.8 tok/s against 81.1 and 83.1, 98.2% hits against
-97.3%) and 384 tokens 0.89 to 0.99 times as fast in three pairs (73.6-77.9 against 79.0-83.0); with
-4,096 MiB, 384 tokens decode 0.98 times as fast on the essay (three pairs) and 0.89 times on the
-Python task (one pair). Every run's text equals the device's.
+the hits: with `--expert-cache-mib 8192` (1,879 slots) a build of November 21 decoded 1,536 tokens
+1.05 times as fast (85.2 and 87.8 tok/s against 81.1 and 83.1, 98.2% hits against 97.3%), and its
+first 384 tokens 0.89 to 0.99 times as fast in three pairs (73.6-77.9 against 79.0-83.0; with
+4,096 MiB 0.98 times on the essay and 0.89 times on the Python task), each run's text equal to the
+device's. The build of November 22 no longer decodes the first tokens slower: three essays after
+a start decode at 87.1, 90.0 and 89.9 tok/s with the built-in profile and at 87.3, 90.1 and 90.0
+with an all-zero one (8,192 MiB, the same text). With 4,096 MiB the CPU share, 18 pinned threads
+by measured speeds, decodes the three essays at 61.6-61.9 tok/s against 58.8-59.5 with
+`--expert-dma-share 1`, which copies every miss, with the same text.

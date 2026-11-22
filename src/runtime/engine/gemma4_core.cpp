@@ -486,6 +486,10 @@ struct Gemma4Core::Request {
     std::vector<std::uint32_t> shared_at;
     // The checkpoint among them (MessageCheckpoint), 0 for none.
     std::uint32_t checkpoint_at = 0;
+    // The checkpoint as MessageCheckpoint::at places it in the last message, before
+    // place_checkpoint() moves it to a prompt step's end (0: none), and where the template closes
+    // that message.
+    std::uint32_t message_checkpoint = 0, closed_at = 0;
     // Media: one mark per unit (an image or a video frame), its soft tokens' span and the identity
     // of what they show, which a reused prefix must share as well as its tokens.
     std::vector<MediaMark> media;
@@ -1061,6 +1065,32 @@ struct Gemma4Core::Impl {
         return static_cast<std::uint32_t>(held.size());
     }
 
+    // Where the prompt departs from what a sequence read (`held`, with `held_media`): their
+    // common prefix, at most what prefix_reuse() allows, cut back to the start of a media unit it
+    // would split; 0 when the media units before it differ.
+    static std::uint32_t departure(const std::vector<TokenId>& held,
+                                   const std::vector<MediaMark>& held_media,
+                                   const Request& prompt) {
+        const auto& tokens = prompt.prompt_tokens;
+        if (held.empty() || tokens.empty()) { return 0; }
+        const std::size_t most =
+            std::min(held.size(), prompt.branches ? tokens.size() : tokens.size() - 1);
+        std::size_t at = std::size_t(
+            std::mismatch(held.begin(), held.begin() + std::ptrdiff_t(most), tokens.begin()).first -
+            held.begin());
+        for (const MediaMark& mark : held_media) {
+            if (mark.begin < at && at < mark.begin + mark.count) { at = mark.begin; }
+        }
+        std::size_t a = 0, b = 0;
+        while (a < held_media.size() && held_media[a].begin < at) { ++a; }
+        while (b < prompt.media.size() && prompt.media[b].begin < at) { ++b; }
+        if (a != b || !std::equal(held_media.begin(), held_media.begin() + std::ptrdiff_t(a),
+                                  prompt.media.begin())) {
+            return 0;
+        }
+        return static_cast<std::uint32_t>(at);
+    }
+
     // The stored image that serves the most of the prompt, and how much.
     [[nodiscard]] std::pair<std::size_t, std::uint32_t> find_stored(const Request& prompt) const {
         return store.best([&](const Store::Image& image) {
@@ -1072,10 +1102,41 @@ struct Gemma4Core::Impl {
     // (MessageCheckpoint::on_steps); where they stay on the GPU, as placed.
     [[nodiscard]] std::uint32_t checkpoint_on_steps(std::uint32_t at,
                                                     std::span<const std::uint32_t> frontiers,
-                                                    std::span<const ContextMediaMark> media) const {
+                                                    std::span<const ContextMediaMark> media,
+                                                    std::uint32_t from) const {
         if (instance.model->expert_residency() == ExpertResidency::Device) { return at; }
         return MessageCheckpoint::on_steps(at, frontiers, media,
-                                           instance.executor->options().prefill_chunk);
+                                           instance.executor->options().prefill_chunk, from);
+    }
+
+    // The states a request keeps besides its checkpoint: the shared prefixes, and the anchor when
+    // it moved inside the last message's closure.
+    [[nodiscard]] static std::vector<std::uint32_t> kept_states(const Request& r) {
+        std::vector<std::uint32_t> kept = r.shared_at;
+        if (r.checkpoint_at != 0) {
+            kept.erase(std::find(kept.begin(), kept.end(), r.checkpoint_at));
+        }
+        if (r.anchor_at < r.closed_at) {
+            kept.insert(std::upper_bound(kept.begin(), kept.end(), r.anchor_at), r.anchor_at);
+        }
+        return kept;
+    }
+
+    // The message checkpoint on the prompt steps that run from `from`: placed when the request is
+    // made (from 0) and again where its prompt resumes, whose steps would otherwise end on both
+    // sides of a checkpoint placed for steps from 0 and add one.
+    void place_checkpoint(Request& r, std::uint32_t from) const {
+        const std::vector<std::uint32_t> kept = kept_states(r);
+        if (r.checkpoint_at != 0) {
+            r.shared_at.erase(std::find(r.shared_at.begin(), r.shared_at.end(), r.checkpoint_at));
+            r.checkpoint_at = 0;
+        }
+        if (r.message_checkpoint == 0) { return; }
+        if (const std::uint32_t at = checkpoint_on_steps(r.message_checkpoint, kept, r.media, from);
+            at > from && at >= kMinStoredTokens && at < r.anchor_at && image_pays(at)) {
+            r.checkpoint_at = at;
+            r.shared_at.insert(std::upper_bound(r.shared_at.begin(), r.shared_at.end(), at), at);
+        }
     }
 
     // Whether a shared prefix or a checkpoint of `tokens` is worth an image: saving it and copying
@@ -1244,7 +1305,20 @@ struct Gemma4Core::Impl {
             const std::uint32_t live       = prefix_reuse(slot.fed, slot.media, r);
             const std::uint32_t anchored   = prefix_reuse(slot.anchor, slot.anchor_media, r);
             const auto [image, from_store] = find_stored(r);
-            if (from_store > std::max(live, anchored)) {
+            // A prompt that departs from what the sequence read after its last prompt (a reply the
+            // template renders otherwise, a regenerated one) resumes where it departs, the
+            // sequence taken back there, when its rings still hold that position's window: the
+            // closure of the last prompt, which the anchor at the default boundary would compute
+            // again, and the reply's tokens the prompt keeps.
+            const std::uint32_t departs = live == 0 ? departure(slot.fed, slot.media, r) : 0;
+            if (departs > std::max(anchored, from_store) &&
+                executor.rewind(s, static_cast<std::uint32_t>(slot.fed.size()) - departs)) {
+                slot.fed.resize(departs);
+                std::erase_if(slot.media,
+                              [departs](const MediaMark& mark) { return mark.begin >= departs; });
+                reused       = departs;
+                r.reuse_path = PrefixReusePath::PrivateEndpoint;
+            } else if (from_store > std::max(live, anchored)) {
                 std::vector<TokenId> tokens  = store.images()[image].tokens;
                 std::vector<MediaMark> media = store.images()[image].media;
                 const PrefixReusePath path   = store.images()[image].path;
@@ -1285,6 +1359,7 @@ struct Gemma4Core::Impl {
         slot.last_used  = ++use_clock;
         slot.disposable = r.disposable;
         r.reused = r.prefilled = reused;
+        if (reused > 0) { place_checkpoint(r, reused); }
         if (drafts > 0) {
             r.speculative.backend      = dspine ? SpeculativeBackend::DSpine : SpeculativeBackend::Mtp;
             r.speculative.enabled      = true;
@@ -1716,6 +1791,7 @@ struct Gemma4Core::Impl {
                 slot.media   = std::move(media);
                 r.reuse_path = path;
                 r.reused = r.prefilled = from_store;
+                place_checkpoint(r, from_store);
                 std::lock_guard lock(stats_mutex);
                 stats.reused_prompt_tokens += from_store;
             }
@@ -2915,19 +2991,10 @@ Gemma4Core::make_request(GroupMember& member, std::optional<std::uint32_t>& budg
         // moved inside that closure, the message before it would count as the last one (in a
         // long system message, a checkpoint and a prompt step more). The moved anchor is a kept
         // state like the shared ones.
-        std::vector<std::uint32_t> kept = request->shared_at;
-        if (request->anchor_at < closed_at) {
-            kept.insert(std::upper_bound(kept.begin(), kept.end(), request->anchor_at),
-                        request->anchor_at);
-        }
-        if (const std::uint32_t at = impl_->checkpoint_on_steps(
-                MessageCheckpoint::at(data.tap_hints.hints, closed_at, kept, request->media), kept,
-                request->media);
-            at >= Impl::kMinStoredTokens && at < request->anchor_at && impl_->image_pays(at)) {
-            request->checkpoint_at = at;
-            request->shared_at.insert(
-                std::upper_bound(request->shared_at.begin(), request->shared_at.end(), at), at);
-        }
+        request->closed_at          = closed_at;
+        request->message_checkpoint = MessageCheckpoint::at(
+            data.tap_hints.hints, closed_at, Impl::kept_states(*request), request->media);
+        impl_->place_checkpoint(*request, 0);
     }
     request->prompt_summary  = prompt_summary;
     request->prepare_seconds = prepare_seconds;
