@@ -98,9 +98,11 @@ of source layers A to B-1 with the embedding, the final mixer and the head, as f
 
 `ninfer` and `ninfer-perplexity` take the same options. Everything the Flash-Next guide describes
 for its text path applies: one to eight concurrent requests in prompt chunks, the context cache
-with host and disk images, every Flash-Next `--kv-dtype`, the n-gram table's residencies
-(`--ngram-residency`, `--ngram-table`, `--no-ngram-table`), structured output, log probabilities,
-thinking budgets and MTP drafts for several requests. Tensor parallelism divides the Gated DeltaNet
+with host and disk images, a checkpoint inside a long last message, the prefix cache file and
+session slots ([Serving](serving.md#context-cache-of-the-other-families)), every Flash-Next
+`--kv-dtype`, the n-gram table's residencies (`--ngram-residency`, `--ngram-table`,
+`--no-ngram-table`), structured output, log probabilities, thinking budgets and MTP drafts for
+several requests. Tensor parallelism divides the Gated DeltaNet
 key heads, the sparse-attention KV heads with their cache and the MLP rows in shares sized to each
 card (`--tensor-split`); the head, the MTP block and the n-gram rows stay on the first device. The
 devices' MLP partial sums are exchanged as FP32 and added in a fixed order, so the result depends on
