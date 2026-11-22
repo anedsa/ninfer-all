@@ -1,7 +1,8 @@
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
-their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Edge0's latent-MoE models built on it,
+their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next with dense Qwen4 and Edge0's latent-MoE
+models built on it,
 Gemma 4 26B-A4B and 31B, Recursive's Flint, DeepSeek-V4.1-Flash and Thinking Machines' looped
 Inkling 2 Mini, on NVIDIA GPUs from Volta to consumer Blackwell, from 8 GB of memory. It serves the
 OpenAI, Anthropic and llama.cpp APIs from one GPU, or from up to eight as pipeline stages on Linux. The same chat model
@@ -26,7 +27,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Novelties only: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured speedup of a path that worked. No fixes of any kind (crashes, wrong output, failed starts, missed cases, regressions and the speedups that win them back, the options and defaults they bring), no guards, diagnostics, internal, CI, build, test or documentation changes, and no chronicle: a date without a novelty gets no line. One line per date, a few words per item, each linked to the document with its details; no descriptions, mechanisms, measurements or hardware. Full rule: CONTRIBUTING.md, "Documentation describes the current state". -->
 
-- **2026-11-22:** Inkling 2's [MXFP8 KV cache](docs/inkling2.md#kv-cache), its default (`--kv-dtype mxfp8`), and its [`rk8v4` and `rk4v4` KV formats](docs/inkling2.md#kv-cache).
+- **2026-11-22:** Inkling 2's [MXFP8 KV cache](docs/inkling2.md#kv-cache), its default (`--kv-dtype mxfp8`), and its [`rk8v4` and `rk4v4` KV formats](docs/inkling2.md#kv-cache); [dense Qwen4](docs/qwen4-dense.md) (`Qwen4ForCausalLM`) from a safetensors checkpoint.
 - **2026-11-21:** [Inkling 2 Mini](docs/inkling2.md), the first looped transformer, from Unsloth's UD-IQ4_XS GGUF with the release's vision tower and DSpark drafter, [published](#supported-models); its [Q8_0 vision tower](docs/inkling2.md#converting) from a llama.cpp mmproj, and IsValorum's [APEX-I MiniPlus](docs/inkling2.md#apex-i-miniplus), [published](#supported-models); Unsloth's [UD-IQ1_M, UD-Q2_K_XL and UD-Q3_K_XL](docs/inkling2.md#smaller-quantizations) (8.2 to 13.4 GiB), [published](#supported-models); Unsloth's [UD-Q8_K_XL](docs/inkling2.md#ud-q8_k_xl) with its BF16 attention, head and experts (22.1 GiB), [published](#supported-models).
 - **2026-11-20:** Faster GGUF prompt chunks with [`cp.async` tiles](docs/device-profiles.md#what-is-calibrated) for Q4_0, Q5_0, Q8_0, IQ4_NL, Q5_K, Q2_0, IQ4_XS and IQ1_M weights; [device profiles](docs/gpus.md) for nine more GPUs.
 - **2026-11-19:** [Gemma 4 31B](docs/gemma4.md#gemma-4-31b) with its MTP assistant and vision tower, [published](#supported-models); [Basalt Flash-Next pack and serving-JSON conversion](docs/basalt-conversion.md), [Q8PLE n-gram tables](docs/qwen3-8-flash-next.md#q8ple-tables) and their [conversion from NVIDIA's FP8 PLE](docs/flash-next-native-dflash2.md#q8ple-directly-from-nvidia-fp8) with a [source-preserving Flash-Next recipe](docs/flash-next-native-dflash2.md), and [native FP16 KV](docs/qwen3-8-flash-next.md#native-fp16-kv) for Flash-Next and Edge0 (`--kv-dtype fp16`).

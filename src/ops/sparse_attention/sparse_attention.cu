@@ -1,10 +1,11 @@
 // ninfer::ops - Qwen3.8-Flash-Next sparse attention over selected blocks and the query's own
-// incomplete block (contract in include/ninfer/ops/sparse_attention.h), over both KV heads or one
-// (a tensor-parallel share). A CTA takes one (query, KV head): its twelve query heads, one warp
-// each, stream positions in 32-key tiles staged in shared memory, each lane scoring one key and
-// accumulating eight output dims online. Up to eight queries split their positions over CTAs of 64
-// positions each (a grid fixed for any position, so a graph replays it), and a second launch
-// merges the partial softmaxes; wider calls run the whole list in one CTA per (query, KV head).
+// incomplete block (contract in include/ninfer/ops/sparse_attention.h), over every KV head or a
+// tensor-parallel share of them. A CTA takes one (query, KV head): its query heads (twelve of each
+// of two KV heads, or six of each of four), one warp each, stream positions in 32-key tiles staged
+// in shared memory, each lane scoring one key and accumulating eight output dims online. Up to
+// eight queries split their positions over CTAs of 64 positions each (a grid fixed for any
+// position, so a graph replays it), and a second launch merges the partial softmaxes; wider calls
+// run the whole list in one CTA per (query, KV head).
 //
 // A quantized cache is decoded while a tile is staged, sixteen dimensions per thread, to FP16 in
 // shared memory: keys in the rotated basis the append stored them in, against a query rotated by
@@ -40,11 +41,12 @@ namespace {
 
 constexpr int kHeadDim     = 256;
 constexpr int kQueryHeads  = 24;
-constexpr int kKvHeads     = 2;
-constexpr int kGroup       = kQueryHeads / kKvHeads; // 12; a share of one KV head has 12 queries
+// Query heads per KV head: 12 of each of two KV heads (Qwen3.8-Flash-Next) or 6 of each of four
+// (dense Qwen4); a tensor-parallel share holds whole KV heads with their queries.
+constexpr int kWideGroup   = 12;
+constexpr int kNarrowGroup = 6;
 constexpr int kTopBlocks   = 512;
 constexpr int kTile        = 32;
-constexpr int kThreads     = kGroup * 32;
 constexpr int kRowStride   = kHeadDim + 2; // BF16 elements; 129 words per row spreads the banks
 constexpr int kSplitTokens    = 8;
 constexpr int kSplitPositions = 2 * kTile;
@@ -63,13 +65,13 @@ __device__ __forceinline__ int position_at(const int* blocks, int count, int tai
 }
 
 // The four planes of one paged KV layer; the scale planes are null where the storage has none.
-// `heads` KV heads per page: both, or the one of a tensor-parallel share.
+// `heads` KV heads per page: every one, or a tensor-parallel share's.
 struct KvPlanes {
     const void* k       = nullptr;
     const void* v       = nullptr;
     const void* k_scale = nullptr;
     const void* v_scale = nullptr;
-    int heads           = kKvHeads;
+    int heads           = 1;
 };
 
 // Element offset of `leading` in the row of position `p` and KV head `head`, for a plane whose
@@ -214,8 +216,8 @@ __device__ __forceinline__ float2 to_float2(const __half2& pair) { return __half
 
 // Split: this CTA takes positions [64 z, 64 z + 64) of the list and leaves its partial softmax in
 // `partial`; otherwise the whole list, normalised into `out`.
-template <bool Split, KvCacheStorage Storage, int Shift>
-__global__ void __launch_bounds__(kThreads)
+template <int Group, bool Split, KvCacheStorage Storage, int Shift>
+__global__ void __launch_bounds__(Group * 32)
     sparse_attention_kernel(const __nv_bfloat16* __restrict__ q, const int* __restrict__ first,
                             const int* __restrict__ selected, const int* __restrict__ counts,
                             KvPlanes planes, const std::int32_t* __restrict__ block_table,
@@ -230,7 +232,8 @@ __global__ void __launch_bounds__(kThreads)
     // NVFP4 and K8V4 store their values rotated as well as their keys.
     constexpr bool kRotatedValues =
         Storage == KvCacheStorage::Nvfp4Group16 || Storage == KvCacheStorage::Fp8KeyNvfp4Value;
-    __shared__ float query[kGroup][kHeadDim];
+    constexpr int kThreads = Group * 32;
+    __shared__ float query[Group][kHeadDim];
     __shared__ Element keys[kTile * kRowStride];
     __shared__ Element values[kTile * kRowStride];
 
@@ -238,7 +241,7 @@ __global__ void __launch_bounds__(kThreads)
     const int kv_head  = blockIdx.y;
     const int warp     = threadIdx.x >> 5;
     const int lane     = threadIdx.x & 31;
-    const int q_head   = kv_head * kGroup + warp;
+    const int q_head   = kv_head * Group + warp;
     const int position   = *first + t;
     const int count    = counts[t];
     const int tail_begin = (position + 1) / 4 * 4;
@@ -460,26 +463,38 @@ void require_plane(const Tensor& plane, DType dtype, std::int32_t leading,
             message);
 }
 
-template <KvCacheStorage Storage, int Shift>
-void launch(const __nv_bfloat16* q, const int* first, const int* selected, const int* counts,
-            const KvPlanes& planes, const std::int32_t* table, float scale, std::int32_t tokens,
-            float* partial, __nv_bfloat16* out, cudaStream_t stream) {
-    const int q_heads = planes.heads * kGroup;
+template <int Group, KvCacheStorage Storage, int Shift>
+void launch_group(const __nv_bfloat16* q, const int* first, const int* selected,
+                  const int* counts, const KvPlanes& planes, const std::int32_t* table,
+                  float scale, std::int32_t tokens, float* partial, __nv_bfloat16* out,
+                  cudaStream_t stream) {
+    const int q_heads = planes.heads * Group;
     if (partial == nullptr) {
-        sparse_attention_kernel<false, Storage, Shift>
-            <<<dim3(tokens, planes.heads), kThreads, 0, stream>>>(
+        sparse_attention_kernel<Group, false, Storage, Shift>
+            <<<dim3(tokens, planes.heads), Group * 32, 0, stream>>>(
                 q, first, selected, counts, planes, table, scale, out, nullptr, q_heads);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    sparse_attention_kernel<true, Storage, Shift>
-        <<<dim3(tokens, planes.heads, kSplits), kThreads, 0, stream>>>(
+    sparse_attention_kernel<Group, true, Storage, Shift>
+        <<<dim3(tokens, planes.heads, kSplits), Group * 32, 0, stream>>>(
             q, first, selected, counts, planes, table, scale, out, partial, q_heads);
     CUDA_CHECK(cudaGetLastError());
-    const auto merge = planes.heads == 1 ? sparse_attention_merge_kernel<kGroup>
-                                         : sparse_attention_merge_kernel<kQueryHeads>;
+    const auto merge = q_heads == 6    ? sparse_attention_merge_kernel<6>
+                       : q_heads == 12 ? sparse_attention_merge_kernel<12>
+                       : q_heads == 18 ? sparse_attention_merge_kernel<18>
+                                       : sparse_attention_merge_kernel<kQueryHeads>;
     merge<<<dim3(tokens, q_heads), kHeadDim, 0, stream>>>(partial, out);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <KvCacheStorage Storage, int Shift>
+void launch(int group, const __nv_bfloat16* q, const int* first, const int* selected,
+            const int* counts, const KvPlanes& planes, const std::int32_t* table, float scale,
+            std::int32_t tokens, float* partial, __nv_bfloat16* out, cudaStream_t stream) {
+    (group == kWideGroup ? launch_group<kWideGroup, Storage, Shift>
+                         : launch_group<kNarrowGroup, Storage, Shift>)(
+        q, first, selected, counts, planes, table, scale, tokens, partial, out, stream);
 }
 
 } // namespace
@@ -495,15 +510,17 @@ std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens) {
 void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, const Tensor& selected,
                               const Tensor& counts, const PagedKVLayerView& cache, float scale,
                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-    require(cache.head_dim == kHeadDim &&
-                (cache.num_kv_heads == kKvHeads || cache.num_kv_heads == 1) &&
+    require(cache.head_dim == kHeadDim && cache.num_kv_heads >= 1 &&
                 cache.block_table.dtype == DType::I32 && cache.block_table.data != nullptr,
-            "cache must be a paged layer of 2 heads of 256, or a share of 1");
+            "cache must be a paged layer of KV heads of 256");
     const std::int32_t heads   = cache.num_kv_heads;
-    const std::int32_t q_heads = heads * kGroup;
+    const std::int32_t q_heads = q.ne[1];
+    // The query heads per KV head: 12 for two KV heads in all, 6 for four.
+    const std::int32_t group = heads > 0 && q_heads % heads == 0 ? q_heads / heads : 0;
     require(q.dtype == DType::BF16 && q.is_contiguous() && q.data != nullptr &&
-                q.ne[0] == kHeadDim && q.ne[1] == q_heads && q.ne[2] > 0 && q.ne[3] == 1,
-            "q must be contiguous BF16 [256, 12 per KV head, tokens]");
+                q.ne[0] == kHeadDim && (group == kWideGroup || group == kNarrowGroup) &&
+                q_heads <= kQueryHeads && q.ne[2] > 0 && q.ne[3] == 1,
+            "q must be contiguous BF16 [256, 12 or 6 per KV head, tokens], at most 24 heads");
     const std::int32_t tokens = q.ne[2];
     require(first_position.dtype == DType::I32 && first_position.data != nullptr &&
                 first_position.numel() >= 1,
@@ -516,7 +533,7 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
             "counts must be contiguous I32 [tokens]");
     require(out.dtype == DType::BF16 && out.is_contiguous() && out.data != nullptr &&
                 out.ne[0] == kHeadDim && out.ne[1] == q_heads && out.ne[2] == tokens,
-            "out must be contiguous BF16 [256, 12 per KV head, tokens]");
+            "out must be contiguous BF16 [256, q heads, tokens]");
     const PagedKVStorageLayout layout = paged_kv_storage_layout(cache.storage, kHeadDim);
     const std::int32_t page_tokens   = cache.k_pages.ne[1];
     require(page_tokens == kPagedKVPageSize || page_tokens == kKvStreamPageTokens,
@@ -558,8 +575,8 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
 #define NINFER_SPARSE_ATTENTION_CASE(STORAGE)                                                      \
     case KvCacheStorage::STORAGE:                                                                  \
         (streamed ? launch<KvCacheStorage::STORAGE, 2> : launch<KvCacheStorage::STORAGE, 6>)(      \
-            q_p, first_p, select_p, counts_p, planes, table_p, scale, tokens, partial_p, out_p,    \
-            stream);                                                                               \
+            group, q_p, first_p, select_p, counts_p, planes, table_p, scale, tokens, partial_p,    \
+            out_p, stream);                                                                        \
         return;
         NINFER_SPARSE_ATTENTION_CASE(BFloat16)
         NINFER_SPARSE_ATTENTION_CASE(Float16)
