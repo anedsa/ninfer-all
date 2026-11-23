@@ -882,30 +882,40 @@ void require_plane(const Tensor& plane, DType dtype, std::int32_t leading,
 template <int Group, KvCacheStorage Storage>
 bool tensor_cores_faster(DeviceTier tier) {
     if constexpr (Group == kWideGroup) {
-        constexpr bool kByteKeys = Storage == KvCacheStorage::Int8Group64 ||
-                                   Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
-                                   Storage == KvCacheStorage::Fp8E4M3Row256 ||
-                                   Storage == KvCacheStorage::Fp8KeyNvfp4Value;
         // Twelve query heads (Qwen3.8-Flash-Next, dense Qwen4 with two KV heads): an RTX PRO 4500
         // Blackwell ran every storage faster here (1.07-3.15 times). An RTX 3090 ran BF16 2.76
         // times, FP16 1.67, bf16p 1.18 and the 4-bit keys (nvfp4, rk4v4, rk4v4-e8, rk2v4-e8)
         // 1.04-1.07 times, but the 8-bit keys (int8, rk8v4, fp8, k8v4) at 0.94-0.99, whose decode
-        // the four warps here hide worse than the SIMT kernel's twelve. Turing keeps the SIMT
-        // kernel: an RTX 2080 Ti ran BF16 and bf16p at 0.32 and 0.20 times on its emulated BF16
-        // MMAs, and its FP16 tiles (1.21-1.73 times) have not run the Op's test on a Turing card.
-        // Volta emulates every MMA.
-        return tier == DeviceTier::Blackwell || (tier == DeviceTier::Ampere && !kByteKeys);
+        // the four warps here hide worse than the SIMT kernel's twelve. An RTX 2080 Ti ran the
+        // FP16 tiles (FP16 and every decoded storage) 1.21-1.73 times, but BF16 and bf16p at 0.32
+        // and 0.20 on its emulated BF16 MMAs. Volta emulates every MMA.
+        constexpr bool kBf16Tiles = std::is_same_v<TileElement<Storage>, __nv_bfloat16>;
+        constexpr bool kByteKeys  = Storage == KvCacheStorage::Int8Group64 ||
+                                   Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+                                   Storage == KvCacheStorage::Fp8E4M3Row256 ||
+                                   Storage == KvCacheStorage::Fp8KeyNvfp4Value;
+        switch (tier) {
+        case DeviceTier::Blackwell: return true;
+        case DeviceTier::Ampere: return !kByteKeys;
+        case DeviceTier::Turing: return !kBf16Tiles;
+        case DeviceTier::Volta: return false;
+        }
+        return false;
     } else {
         // Six query heads (dense Qwen4 with four KV heads): the 16-row tile holds six queries, so
         // each staged K and V tile serves half as many rows, while the SIMT kernel's work follows
         // the query heads. An RTX 3090 ran BF16 2.54 times, FP16 1.51 and bf16p 1.09 here, every
         // other storage 0.79-0.86; an RTX 5080 ran BF16 2.83 and FP16 1.46, bf16p 0.98 and the
-        // others 0.66-0.72. Turing and Volta keep the SIMT kernel, as for twelve.
+        // others 0.66-0.72. Turing (not measured for six) and Volta keep the SIMT kernel.
         constexpr bool kHalfTiles =
             Storage == KvCacheStorage::BFloat16 || Storage == KvCacheStorage::Float16;
-        return (tier == DeviceTier::Blackwell && kHalfTiles) ||
-               (tier == DeviceTier::Ampere &&
-                (kHalfTiles || Storage == KvCacheStorage::Bf16Packed));
+        switch (tier) {
+        case DeviceTier::Blackwell: return kHalfTiles;
+        case DeviceTier::Ampere: return kHalfTiles || Storage == KvCacheStorage::Bf16Packed;
+        case DeviceTier::Turing:
+        case DeviceTier::Volta: return false;
+        }
+        return false;
     }
 }
 
